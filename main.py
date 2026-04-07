@@ -25,7 +25,7 @@ load_dotenv()
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
-CHAT_MODEL = "nvidia/llama-3.1-nemotron-70b-instruct"
+CHAT_MODEL = "meta/llama-3.3-70b-instruct"
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")
 COLLECTION = os.environ.get("QDRANT_COLLECTION", "bu_projects")
