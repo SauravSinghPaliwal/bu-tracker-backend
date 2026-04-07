@@ -4,7 +4,7 @@ Deploy on Vercel (as a standalone project) or any Python host.
 """
 import json
 import os
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -15,6 +15,7 @@ from langchain_openai import ChatOpenAI
 from openai import OpenAI as RawOpenAI
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, PointStruct, VectorParams
 
 load_dotenv()
 
@@ -83,9 +84,52 @@ class ChatRequest(BaseModel):
     annualTarget: float = 500.0
 
 
+class SyncRequest(BaseModel):
+    projects: List[Project]
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+VECTOR_SIZE = 1024  # nvidia/nv-embedqa-e5-v5 output dimension
+
+
+def project_to_text(p: Project) -> str:
+    return "\n".join([
+        f"Project: {p.projectName}",
+        f"Customer: {p.customer}",
+        f"Value: \u20b9{p.value} Lakhs",
+        f"Quarter: {p.quarter}",
+        f"Status: {p.status}",
+        f"Expected Close: {p.expectedClose or 'Not set'}",
+        f"Notes: {p.notes or 'None'}",
+    ])
+
+
+def id_from_string(s: str) -> int:
+    """Stable numeric ID from a string (djb2 hash → positive uint32)."""
+    h = 5381
+    for c in s:
+        h = ((h << 5) + h) ^ ord(c)
+    return h & 0xFFFFFFFF
+
+
+def get_qdrant_client() -> QdrantClient:
+    kwargs: dict = {"url": QDRANT_URL}
+    if QDRANT_API_KEY:
+        kwargs["api_key"] = QDRANT_API_KEY
+    return QdrantClient(**kwargs)
+
+
+def ensure_collection(client: QdrantClient) -> None:
+    existing = {c.name for c in client.get_collections().collections}
+    if COLLECTION not in existing:
+        client.create_collection(
+            COLLECTION,
+            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+        )
+
+
 def embed_query(text: str) -> list[float]:
     res = get_embed_client().embeddings.create(
         model=EMBED_MODEL,
@@ -96,12 +140,22 @@ def embed_query(text: str) -> list[float]:
     return res.data[0].embedding
 
 
+def embed_batch(texts: list[str]) -> list[list[float]]:
+    """Embed multiple texts as passages (for indexing)."""
+    if not texts:
+        return []
+    res = get_embed_client().embeddings.create(
+        model=EMBED_MODEL,
+        input=texts,
+        encoding_format="float",
+        extra_body={"input_type": "passage", "truncate": "END"},
+    )
+    return [d.embedding for d in sorted(res.data, key=lambda x: x.index)]
+
+
 def get_qdrant_context(question: str) -> str:
     try:
-        kwargs: dict = {"url": QDRANT_URL}
-        if QDRANT_API_KEY:
-            kwargs["api_key"] = QDRANT_API_KEY
-        client = QdrantClient(**kwargs)
+        client = get_qdrant_client()
 
         info = client.get_collection(COLLECTION)
         if (info.points_count or 0) == 0:
@@ -109,7 +163,7 @@ def get_qdrant_context(question: str) -> str:
 
         vector = embed_query(question)
         results = client.search(
-            collection_name=COLLECTION,
+            COLLECTION,
             query_vector=vector,
             limit=5,
             score_threshold=0.3,
@@ -200,3 +254,56 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+@app.post("/sync")
+async def sync(req: SyncRequest) -> Dict:
+    """
+    Embed all projects with nv-embedqa-e5-v5 (passage mode) and upsert into Qdrant.
+    Deletes orphaned points for projects no longer in the list.
+    """
+    client = get_qdrant_client()
+    ensure_collection(client)
+
+    if not req.projects:
+        client.delete(COLLECTION, points_selector={"filter": {"must": []}})
+        return {"synced": 0, "deleted": 0}
+
+    # Batch-embed all projects as passages
+    texts = [project_to_text(p) for p in req.projects]
+    vectors = embed_batch(texts)
+
+    points = [
+        PointStruct(
+            id=id_from_string(p.id),
+            vector=vectors[i],
+            payload=p.model_dump(),
+        )
+        for i, p in enumerate(req.projects)
+    ]
+    client.upsert(COLLECTION, points=points, wait=True)
+
+    # Remove points for deleted projects
+    current_ids = {id_from_string(p.id) for p in req.projects}
+    scroll = client.scroll(COLLECTION, limit=1000, with_payload=False, with_vectors=False)
+    orphans = [pt.id for pt in scroll[0] if pt.id not in current_ids]
+    if orphans:
+        client.delete(COLLECTION, points_selector={"points": orphans})
+
+    return {"synced": len(points), "deleted": len(orphans)}
+
+
+@app.get("/status")
+async def status() -> Dict:
+    """Return Qdrant connection health and collection point count."""
+    try:
+        client = get_qdrant_client()
+        collections = {c.name for c in client.get_collections().collections}
+        exists = COLLECTION in collections
+        point_count = 0
+        if exists:
+            info = client.get_collection(COLLECTION)
+            point_count = info.points_count or 0
+        return {"connected": True, "collection": COLLECTION, "exists": exists, "pointCount": point_count}
+    except Exception as exc:
+        return {"connected": False, "error": str(exc)}
