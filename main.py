@@ -266,7 +266,9 @@ async def sync(req: SyncRequest) -> Dict:
     ensure_collection(client)
 
     if not req.projects:
-        client.delete(COLLECTION, points_selector={"filter": {"must": []}})
+        # Drop and recreate the collection to clear all points
+        client.delete_collection(COLLECTION)
+        ensure_collection(client)
         return {"synced": 0, "deleted": 0}
 
     # Batch-embed all projects as passages
@@ -288,7 +290,7 @@ async def sync(req: SyncRequest) -> Dict:
     scroll = client.scroll(COLLECTION, limit=1000, with_payload=False, with_vectors=False)
     orphans = [pt.id for pt in scroll[0] if pt.id not in current_ids]
     if orphans:
-        client.delete(COLLECTION, points_selector={"points": orphans})
+        client.delete(COLLECTION, points_selector=orphans)
 
     return {"synced": len(points), "deleted": len(orphans)}
 
